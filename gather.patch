@@ -1,0 +1,169 @@
+diff --git a/src/flag_gems/runtime/backend/_ascend/ops/gather.py b/src/flag_gems/runtime/backend/_ascend/ops/gather.py
+index 5a3a363..3147072 100644
+--- a/src/flag_gems/runtime/backend/_ascend/ops/gather.py
++++ b/src/flag_gems/runtime/backend/_ascend/ops/gather.py
+@@ -23,6 +23,7 @@ from flag_gems.utils.shape_utils import restride_dim
+ 
+ logger = logging.getLogger(__name__)
+ UB_SIZE_BYTES = 192 * 1024
++MAX_RANK = 5
+ 
+ 
+ def compute_base_offset(shape, strides, dim):
+@@ -91,6 +92,141 @@ def gather_flat_fixed(inp: torch.Tensor, dim: int, index: torch.Tensor, out=None
+     return out
+ 
+ 
++@libentry()
++@triton.heuristics({"BLOCK_SIZE": lambda args: 1024})
++@triton.jit
++def _gather_strided_kernel(
++    inp,
++    index,
++    out,
++    idx_shape0,
++    idx_shape1,
++    idx_shape2,
++    idx_shape3,
++    idx_shape4,
++    idx_stride0,
++    idx_stride1,
++    idx_stride2,
++    idx_stride3,
++    idx_stride4,
++    out_stride0,
++    out_stride1,
++    out_stride2,
++    out_stride3,
++    out_stride4,
++    inp_stride0,
++    inp_stride1,
++    inp_stride2,
++    inp_stride3,
++    inp_stride4,
++    dim,
++    dim_stride,
++    N,
++    BLOCK_SIZE: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    offset = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE).to(tl.int64)
++    mask = offset < N
++
++    # Decompose the flat offset into per-dim coordinates over the index
++    # shape. Missing dims are padded by the host with shape=1 / stride=0,
++    # so their coordinate is always 0 and contributes nothing.
++    cur = offset
++    coord0 = cur % idx_shape0
++    cur = cur // idx_shape0
++    coord1 = cur % idx_shape1
++    cur = cur // idx_shape1
++    coord2 = cur % idx_shape2
++    cur = cur // idx_shape2
++    coord3 = cur % idx_shape3
++    cur = cur // idx_shape3
++    coord4 = cur % idx_shape4
++
++    index_offset = (
++        coord0 * idx_stride0
++        + coord1 * idx_stride1
++        + coord2 * idx_stride2
++        + coord3 * idx_stride3
++        + coord4 * idx_stride4
++    )
++    out_offset = (
++        coord0 * out_stride0
++        + coord1 * out_stride1
++        + coord2 * out_stride2
++        + coord3 * out_stride3
++        + coord4 * out_stride4
++    )
++    # inp strides come from restride_dim(inp, dim, index.shape): the stride
++    # along `dim` is zeroed, so all dims contribute uniformly here and the
++    # gather index itself is applied separately via dim_stride below.
++    base = (
++        coord0 * inp_stride0
++        + coord1 * inp_stride1
++        + coord2 * inp_stride2
++        + coord3 * inp_stride3
++        + coord4 * inp_stride4
++    )
++
++    cur_index = tl.load(index + index_offset, mask=mask, other=0)
++    inp_offset = base + cur_index * dim_stride
++    val = tl.load(inp + inp_offset, mask=mask, other=0)
++    tl.store(out + out_offset, val, mask=mask)
++
++
++def gather_strided(inp: torch.Tensor, dim: int, index: torch.Tensor, out=None):
++    logger.debug("GEMS_ASCEND GATHER (strided index)")
++    if out is None:
++        out = torch.empty_like(index, dtype=inp.dtype, device=inp.device)
++
++    N = index.numel()
++    # dim_stride must be taken from the ORIGINAL inp: restride_dim zeroes
++    # the stride along dim below.
++    dim_stride = inp.stride(dim)
++    inp_strided = restride_dim(inp, dim, index.shape)
++
++    def pad_shape(xs):
++        return list(xs) + [1] * (MAX_RANK - len(xs))
++
++    def pad_stride(xs):
++        return list(xs) + [0] * (MAX_RANK - len(xs))
++
++    idx_shapes = pad_shape(index.shape)
++    idx_strides = pad_stride(index.stride())
++    out_strides = pad_stride(out.stride())
++    inp_strides = pad_stride(inp_strided.stride())
++
++    grid = lambda META: (triton.cdiv(N, META["BLOCK_SIZE"]),)
++    _gather_strided_kernel[grid](
++        inp_strided,
++        index,
++        out,
++        idx_shapes[0],
++        idx_shapes[1],
++        idx_shapes[2],
++        idx_shapes[3],
++        idx_shapes[4],
++        idx_strides[0],
++        idx_strides[1],
++        idx_strides[2],
++        idx_strides[3],
++        idx_strides[4],
++        out_strides[0],
++        out_strides[1],
++        out_strides[2],
++        out_strides[3],
++        out_strides[4],
++        inp_strides[0],
++        inp_strides[1],
++        inp_strides[2],
++        inp_strides[3],
++        inp_strides[4],
++        dim,
++        dim_stride,
++        N,
++    )
++    return out
++
++
+ def gather(inp, dim, index, out=None, sparse_grad=False):
+     logger.debug("GEMS_ASCEND GATHER")
+     if inp.ndim != index.ndim:
+@@ -102,7 +238,13 @@ def gather(inp, dim, index, out=None, sparse_grad=False):
+         out = torch.empty_like(index, dtype=inp.dtype, device=inp.device)
+ 
+     dim = dim % inp.dim()
+-    return gather_flat_fixed(inp, dim, index, out)
++    if index.is_contiguous() or index.ndim > MAX_RANK:
++        # flat fast path; for over-sized ranks force contiguity first
++        # (rank > MAX_RANK cannot be expressed in the static kernel signature)
++        if not index.is_contiguous():
++            index = index.contiguous()
++        return gather_flat_fixed(inp, dim, index, out)
++    return gather_strided(inp, dim, index, out)
+ 
+ 
+ def gather_backward(grad, self, dim, index, sparse_grad):
