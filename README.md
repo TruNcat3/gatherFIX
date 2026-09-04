@@ -76,6 +76,17 @@ ASCEND_LAUNCH_BLOCKING=1 python tests/test_rank_coverage.py  # rank 1-6 全覆�
 ASCEND_LAUNCH_BLOCKING=1 python tests/gap_checks.py          # backward / 非连续 out / rank>5
 ```
 
+**端到端**（真实 transformers 模型，需先下载 tiny-random-BertModel 到本地缓存）：
+
+```bash
+ASCEND_LAUNCH_BLOCKING=1 HF_HUB_OFFLINE=1 python tests/test_model_e2e.py
+# 预期: gather op invoked: 1 times / hidden states bitwise equal / grads allclose / PASS
+```
+
+这跑的是真实 `BertModel` 前向+反向：不传 `token_type_ids` 时（推理引擎和 torch.export
+tracing 的常见输入），`BertEmbeddings` 内部用 `torch.gather(expand(buffer), 1, position_ids)`
+重建 segment id——模型内的真实 gather 调用，由修复后的算子接管执行，输出与原生逐位一致。
+
 ## 目录结构
 
 ```
@@ -89,6 +100,7 @@ ASCEND_LAUNCH_BLOCKING=1 python tests/gap_checks.py          # backward / 非连
 │   ├── test_gather_standalone.py#   主测试：15 用例（9 非连续矩阵 + 快路径 + dtype）
 │   ├── test_rank_coverage.py    #   rank 1-6 全维度验证
 │   ├── gap_checks.py            #   backward / 非连续 out / rank>5 边界
+│   ├── test_model_e2e.py        #   端到端：真实 BERT 前向+反向（transformers）
 │   ├── bench_gather.py          #   连续路径性能护栏
 │   └── test_gather.py           #   FlagGems 仓库版 pytest 套件（需放回仓库 tests/ 下跑）
 └── docs/
@@ -115,3 +127,26 @@ ASCEND_LAUNCH_BLOCKING=1 python tests/gap_checks.py          # backward / 非连
 - FlagGems 里其他 index 类算子（`index_fill`/`index_add` 等）存在同模式的按偏移直读写法，
   未逐一审计——建议上游单独排查
 - 上游 FlagGems master 该文件与 v5.3.5 一致，本修复可直接整理成 PR 提交
+- 端到端测试里模型触发的 gather 调用恰好是连续布局（non-contig 0 次）——e2e 证明了
+  "修复版算子在真实模型里工作正常"，非连续布局的正确性由单测矩阵（15+8 用例）保证。
+  如果你的模型用非连续 index 调 gather（如 MoE top-k 路由），建议加一轮针对性验证
+
+## 环境情报（踩坑记录，与 gather 修复无关但值得知道）
+
+- **flag_gems 5.3.5 全量 `enable()` 在 transformers 5.x 上会崩**：新 Cache 路径触发
+  `lift_fresh` 算子的 GIL 崩溃。e2e 测试用 `use_gems(include=["gather"])` 只开单个算子绕开
+- **插桩 flag_gems 的正确姿势**：注册表 `FULL_CONFIG_BY_FUNC` 在 import 时捕获函数对象，
+  运行时改模块属性对 registrar 不可见，必须直接换表条目；且同一个 gather.py 会因相对导入
+  被加载成两份模块（`_ascend.ops.gather` 与 `flag_gems.runtime.backend._ascend.ops.gather`）
+- huggingface.co 直连不通时用 `HF_ENDPOINT=https://hf-mirror.com`
+
+## 验证矩阵汇总
+
+| 验证项 | 结果 |
+|---|---|
+| issue #5746 原复现（修复前） | NPU 507035 崩溃 |
+| 非连续 index 回归矩阵（expand/transpose/slice × dim 0/1/2） | 修复前 9/9 失败 → 修复后 9/9 通过 |
+| rank 1-6 全维度 + 复合视图 | 8/8 通过 |
+| 全量 FlagGems gather 套件（仓库 pytest） | 72 passed / 0 failed |
+| 端到端：真实 BERT 前向+反向 | gather 被真实调用，输出逐位一致，梯度误差 1.4e-12 |
+| 连续路径性能 | 与修复前差异在机器噪声内 |
