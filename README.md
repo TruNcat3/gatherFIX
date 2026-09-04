@@ -57,9 +57,9 @@ rank > 5 走拷贝兜底，正确性不受影响。
 **部署**（唯一要动的文件是 flag_gems 包里的这一个）：
 
 ```bash
-# 1. 备份并替换（路径按实际安装位置调整）
+# 1. 备份并替换：src/gather.py 就是修复后的完整文件，直接替换 flag_gems 包内同名文件
 cp /path/to/site-packages/flag_gems/runtime/backend/_ascend/ops/gather.py src/gather.py.orig.bak
-cp src/gather.py.fixed /path/to/site-packages/flag_gems/runtime/backend/_ascend/ops/gather.py
+cp src/gather.py /path/to/site-packages/flag_gems/runtime/backend/_ascend/ops/gather.py
 
 # 2. 清掉旧字节码缓存，否则可能仍加载旧 .pyc
 find /path/to/site-packages/flag_gems/runtime/backend/_ascend -name __pycache__ -exec rm -rf {} +
@@ -82,7 +82,7 @@ ASCEND_LAUNCH_BLOCKING=1 python tests/gap_checks.py          # backward / 非连
 ├── README.md                    # 本文
 ├── gather.patch                 # 最小 diff（169 行），git apply 用
 ├── src/
-│   ├── gather.py.fixed          # 修复后的完整算子文件，整文件替换用
+│   ├── gather.py                # 修复后的完整算子文件，直接替换 flag_gems 包内同名文件
 │   └── gather.py.orig           # v5.3.5 原版备份（对照/回滚用）
 ├── tests/                       # 全部零依赖，直接 python 运行
 │   ├── repro_5746.py            #   issue 复现 + 修复验收
