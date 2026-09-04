@@ -1,119 +1,117 @@
-# FlagGems gather 修复交付包（issue #5746）
+# gatherFIX — FlagGems Ascend gather 算子非连续 index 越界修复
 
-## 一、要改 FlagGems 中的哪个文件（明确答案）
+修复 [FlagGems issue #5746](https://github.com/flagos-ai/FlagGems/issues/5746)：在昇腾 NPU 上开启 flag_gems 后，`torch.gather` 传入非连续存储的 `index`（如 `expand` 出来的视图）会导致设备侧越界访问，进程崩溃。
 
-**只改这一个文件：**
-
-```
-src/flag_gems/runtime/backend/_ascend/ops/gather.py
-```
-
-即已安装 flag_gems 包里的（site-packages 路径按实际安装位置调整）：
+一句话版本：**原 kernel 假设 index 在内存里连续平铺，我们写了一个尊重 stride 的新 kernel，非连续 index 分流过去，连续路径原样保留。**
 
 ```
-/usr/local/python3.11.15/lib/python3.11/site-packages/flag_gems/runtime/backend/_ascend/ops/gather.py
+修复前: RuntimeError ... error code is 507035 (vector core exception)
+修复后: 输出与原生 torch.gather 逐位一致
 ```
 
-用本目录的 `gather.py.fixed` **整文件替换**即可（该文件其余部分与 v5.3.5 原版逐字节一致，改动只在此文件内部，不涉及任何其他文件）。
+## 问题是怎么回事
 
-改动内容（对照原版）：
-1. 新增常量 `MAX_RANK = 5`（第 26 行附近）
-2. 新增 `_gather_strided_kernel` Triton kernel + `gather_strided()` 包装函数
-3. `gather()` 入口函数末尾改为三路分流（连续→原 flat 路径；非连续 rank≤5→strided kernel；rank>5→先 contiguous()）
-
-## 一b、Bug 具体在哪个函数（对照 gather.py.orig）
-
-`gather.py.orig` = FlagGems v5.3.5 原版算子文件（从 site-packages 现场备份），结构：
-
-| 行号（原版）| 函数 | 状态 |
-|---|---|---|
-| L28 | `compute_base_offset` | 未改动（继续服务 flat 路径）|
-| **L45** | `_gather_flat_kernel_fixed` | **错误源头，但一字未改**（见下）|
-| L67 | `gather_flat_fixed` | 未改动（连带责任：未检查 index 连续性就传给 kernel）|
-| L94 | `gather()` | **入口分流点，唯一被改的原函数**（末尾 6 行 → if/else 三路）|
-| L108 | `gather_backward` | 未改动（走 scatter_ 路径，实测无此 bug）|
-
-**肇事代码**：`_gather_flat_kernel_fixed` 内 L58
+issue 里的最小复现：
 
 ```python
-cur_index = tl.load(index + offset, mask=mask, other=0)   # ← 错误源头
+x = torch.randn(4, 16, 384, device="npu:0", dtype=torch.float16)
+idx = torch.full((4, 1, 1), 15, device="npu:0", dtype=torch.int64).expand(4, 1, 384)
+torch.gather(x, 1, idx)   # 崩溃
 ```
 
-该 kernel 假设 index 在内存连续平铺，用 `index + offset` 线性读取。当 index 是
-`expand` 出来的非连续视图（如 stride=(1,0,0)、底层仅 4 个元素、numel=1536）时：
+`idx` 是 expand 出来的视图：逻辑上是 (4,1,384) 共 1536 个元素，底层 storage 只有 4 个。
+flag_gems 的 Ascend 覆写 kernel（`_gather_flat_kernel_fixed`）里有一行：
 
-1. offset 越过 storage 末尾，越界读取 ~12KB 拿到垃圾值
-2. `inp_offset = base + 垃圾值 × dim_stride(384)` 寻址失控
-3. 对 inp 的 GM 越界访问 → 设备侧 vector core 异常 → 同步时报 507035
-
-**Bug 函数 ≠ 被改函数（重要）**：修复没有动 `_gather_flat_kernel_fixed` 一行。
-它在 index 连续时是正确的，且是 PR #1290 的性能优化成果——保留它作为快路径。
-修复策略是在 `gather()` 入口把非连续 index **分流**给新增的 stride 感知 kernel：
-
-```
-gather() 入口（L94，唯一修改的原函数）
-├─ index.is_contiguous()           → 原路径 gather_flat_fixed（零改动，零风险）
-├─ 非连续 且 index.ndim <= 5       → 新增 gather_strided → _gather_strided_kernel
-└─ 非连续 且 index.ndim > 5        → index.contiguous() 后走原 flat 路径兜底
+```python
+cur_index = tl.load(index + offset, mask=mask, other=0)
 ```
 
-新 kernel `_gather_strided_kernel` 对 index/out/inp 三组张量全部逐维计算
-`偏移 = Σ coord_i × stride_i`（缺失维补 shape=1/stride=0），非连续 index 天然正确，
-且顺带支持了非连续 out（实测 gap_checks.py 用例 3）。
+`index + offset` 把 index 当连续数组线性读——于是 kernel 一路读到 storage 之外 12KB，
+拿到的内存垃圾被当作 gather 索引，乘上 stride 去寻址输入张量，直接打出 GM 越界。
+设备侧异常是异步上报的，所以 Python 端看到的报错（507035）位置和肇事点对不上，
+这也是这个 bug 最初不好定位层次的原因（bug 在 flag_gems kernel 层，不在 torch_npu/CANN）。
 
-## 二、本目录文件清单
+## 修复思路
 
-| 文件 | 说明 |
-|---|---|
-| `gather.py.fixed` | 修复后的完整算子文件，直接替换用 |
-| `gather.patch` | 同样改动的 diff（169 行），`git apply` 或人工核对用 |
-| `test_gather.py` | 修复后的完整测试文件（原 63 用例 + 新增 9 个非连续 index 用例）|
-| `repro_5746.py` | issue #5746 最小复现 + 验收脚本（修复后应打印 OK）|
-| `gap_checks.py` | 边界补充验证（backward / rank-6 / 非连续 out）|
-| `bench_gather.py` | 性能护栏脚本 |
-| `GATHER_5746_REPORT.md` | 完整分析报告（问题/方案/实验/自查清单）|
-| `README.md` | 本说明 |
+肇事函数 `_gather_flat_kernel_fixed` 对连续 index 是**正确的**，而且是社区性能优化
+（PR #1290）的成果，所以我们一行没动它。改的是入口 `gather()`，加了一次分流：
 
-## 三、部署步骤
+```
+index.is_contiguous()？ ── 是 ──→ 原路径（零改动，连续场景零风险零回归）
+       │
+       否，rank ≤ 5 ──────→ 新 kernel：每维传 shape/stride，
+       │                    偏移 = Σ coord_i × stride_i，逐维算
+       否，rank > 5 ──────→ index.contiguous() 拷贝后走原路径兜底
+```
+
+新 kernel 的正确性只依赖"线性坐标逐维分解"这个恒等式，与维度数无关——
+rank 1 到 6、expand/transpose/slice/permute 及其复合视图都实测通过
+（见 `tests/test_rank_coverage.py`）。rank ≤ 5 是 Triton 静态签名的工程限制，
+rank > 5 走拷贝兜底，正确性不受影响。
+
+## 怎么用
+
+前置：昇腾环境（本修复在 Ascend 910 + CANN 8.5 / torch 2.10 / torch_npu 2.10
++ flag_gems 5.3.5 上验证）。
+
+**部署**（唯一要动的文件是 flag_gems 包里的这一个）：
 
 ```bash
-# 1. 备份原文件
-cp /usr/local/python3.11.15/lib/python3.11/site-packages/flag_gems/runtime/backend/_ascend/ops/gather.py \
-   /root/gather_5746_fix/gather.py.orig
+# 1. 备份并替换（路径按实际安装位置调整）
+cp /path/to/site-packages/flag_gems/runtime/backend/_ascend/ops/gather.py src/gather.py.orig.bak
+cp src/gather.py.fixed /path/to/site-packages/flag_gems/runtime/backend/_ascend/ops/gather.py
 
-# 2. 替换
-cp /root/gather_5746_fix/gather.py.fixed \
-   /usr/local/python3.11.15/lib/python3.11/site-packages/flag_gems/runtime/backend/_ascend/ops/gather.py
-
-# 3. 清理该算子的字节码缓存（重要，否则可能仍加载旧 pyc）
-find /usr/local/python3.11.15/lib/python3.11/site-packages/flag_gems -name "__pycache__" -path "*_ascend*" -exec rm -rf {} + 2>/dev/null
-# 若曾跑过本仓库测试，也清理仓库内缓存：
-find /root/FlagGems/src -name "__pycache__" -exec rm -rf {} + 2>/dev/null
+# 2. 清掉旧字节码缓存，否则可能仍加载旧 .pyc
+find /path/to/site-packages/flag_gems/runtime/backend/_ascend -name __pycache__ -exec rm -rf {} +
 ```
 
-## 四、验证命令
+不想手动替换的话，`gather.patch` 是同样的改动，可以在 FlagGems 仓库里 `git apply gather.patch`。
+
+**验证**（都在本目录，零依赖，直接 python 跑）：
 
 ```bash
-cd /root/gather_5746_fix
-
-# 1. 独立测试（推荐，零依赖，15 个用例，应输出 TOTAL: 15 passed, 0 failed）
-ASCEND_LAUNCH_BLOCKING=1 python test_gather_standalone.py
-
-# 2. issue 复现验收（应打印 OK，修复前为 507035 崩溃）
-ASCEND_LAUNCH_BLOCKING=1 python repro_5746.py
-
-# 3. 边界验证（三行均应 RAN 且 equal=True）
-ASCEND_LAUNCH_BLOCKING=1 python gap_checks.py
+ASCEND_LAUNCH_BLOCKING=1 python tests/repro_5746.py          # issue 原复现，应打印 OK
+ASCEND_LAUNCH_BLOCKING=1 python tests/test_gather_standalone.py  # 15 用例，TOTAL: 15 passed
+ASCEND_LAUNCH_BLOCKING=1 python tests/test_rank_coverage.py  # rank 1-6 全覆盖，8 passed
+ASCEND_LAUNCH_BLOCKING=1 python tests/gap_checks.py          # backward / 非连续 out / rank>5
 ```
 
-**注意**：本目录的 `test_gather.py` 是 FlagGems 仓库内测试文件，依赖仓库的
-`tests/accuracy_utils.py`、`tests/conftest.py` 和 pytest，**不能** `python test_gather.py`
-单独运行（会报 `ImportError: attempted relative import with no known parent package`，
-error.log 里的 ERR99999 就是这个的尾部输出）。要么：
+## 目录结构
 
-- 用上面的 `test_gather_standalone.py`（等价覆盖，直接 python 运行），或
-- 把 `test_gather.py` 放回 FlagGems 仓库 `tests/` 下跑：
-  ```bash
-  cd /root/FlagGems && ASCEND_LAUNCH_BLOCKING=1 python -m pytest tests/test_gather.py -q
-  # 预期 72 passed
-  ```
+```
+├── README.md                    # 本文
+├── gather.patch                 # 最小 diff（169 行），git apply 用
+├── src/
+│   ├── gather.py.fixed          # 修复后的完整算子文件，整文件替换用
+│   └── gather.py.orig           # v5.3.5 原版备份（对照/回滚用）
+├── tests/                       # 全部零依赖，直接 python 运行
+│   ├── repro_5746.py            #   issue 复现 + 修复验收
+│   ├── test_gather_standalone.py#   主测试：15 用例（9 非连续矩阵 + 快路径 + dtype）
+│   ├── test_rank_coverage.py    #   rank 1-6 全维度验证
+│   ├── gap_checks.py            #   backward / 非连续 out / rank>5 边界
+│   ├── bench_gather.py          #   连续路径性能护栏
+│   └── test_gather.py           #   FlagGems 仓库版 pytest 套件（需放回仓库 tests/ 下跑）
+└── docs/
+    └── GATHER_5746_REPORT.md    # 完整分析报告：根因、层次定位、实验矩阵、自查清单
+```
+
+## 如果你想深究 bug 在哪一行
+
+`src/gather.py.orig`（v5.3.5 原版）的函数地图：
+
+| 原版行号 | 函数 | 与本次修复的关系 |
+|---|---|---|
+| L58 | `_gather_flat_kernel_fixed` 内 `tl.load(index + offset, ...)` | **肇事行**，但一字未改（它对连续 index 是对的） |
+| L67 | `gather_flat_fixed` | 未改（连带责任：没检查 index 连续性就传 kernel） |
+| L94 | `gather()` | **唯一被改的原函数**：入口加三路分流 |
+| L28 / L108 | `compute_base_offset` / `gather_backward` | 未改（后者走 scatter_ 路径，实测无此 bug） |
+
+完整的失败链条、逐项实验数据和"哪些验证做了/哪些明确没做"的诚实清单，
+见 `docs/GATHER_5746_REPORT.md`。
+
+## 已知边界（不装完美）
+
+- 性能护栏只在小形状上测过，且机器有外部负载，结论是"差异淹没在噪声里"而非精确回归数据
+- FlagGems 里其他 index 类算子（`index_fill`/`index_add` 等）存在同模式的按偏移直读写法，
+  未逐一审计——建议上游单独排查
+- 上游 FlagGems master 该文件与 v5.3.5 一致，本修复可直接整理成 PR 提交
