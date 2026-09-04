@@ -1,5 +1,6 @@
 """Standalone unit test for the fixed gather op — imports the op DIRECTLY,
 no torch dispatch / flag_gems registration involved.
+wt-2026-09-04-fix: direct-call unit test for the stride-aware gather op (issue #5746)
 
 This is the real "standalone" contract: point MOD at the file you want to
 test (default: the deployed site-packages copy) and run.

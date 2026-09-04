@@ -1,4 +1,5 @@
 """Verify the strided gather kernel across ALL supported ranks (1-5) with
+wt-2026-09-04-fix: rank 1-6 stride-pattern coverage test (issue #5746)
 mixed non-contiguous stride patterns, not just the 3D issue case."""
 import torch
 import torch_npu  # noqa: F401

@@ -153,6 +153,8 @@ def test_gather_backward(inp_shape, dim, dtype, duplicate_indices):
         pytest.param("slice", id="slice"),  # non-unit step
     ],
 )
+# wt-2026-09-04-fix: regression test for non-contiguous index (issue #5746)
+# 9 cases: expand / transpose / slice x dim 0/1/2, all failed with NPU 507035 before the fix.
 def test_gather_non_contiguous_index(dim, make_index):
     # Regression for issue #5746: kernels must respect index strides
     B, S, H = 4, 16, 64
