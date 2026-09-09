@@ -24,6 +24,7 @@ from flag_gems.utils.shape_utils import restride_dim
 logger = logging.getLogger(__name__)
 UB_SIZE_BYTES = 192 * 1024
 # wt-2026-09-04-fix: add MAX_RANK for static-signature stride-aware kernel (issue #5746)
+# wt <wangt635@ustc.edu.cn>
 MAX_RANK = 5
 
 
@@ -94,6 +95,7 @@ def gather_flat_fixed(inp: torch.Tensor, dim: int, index: torch.Tensor, out=None
 
 
 # wt-2026-09-04-fix: stride-aware gather kernel for non-contiguous index (issue #5746)
+# wt <wangt635@ustc.edu.cn>
 # Computes index/out/inp offsets per dimension as sum(coord_i * stride_i) instead of
 # linearizing index reads. Missing dims padded by host with shape=1 / stride=0.
 @libentry()
@@ -178,6 +180,7 @@ def _gather_strided_kernel(
 
 
 # wt-2026-09-04-fix: host wrapper for _gather_strided_kernel (issue #5746)
+# wt <wangt635@ustc.edu.cn>
 def gather_strided(inp: torch.Tensor, dim: int, index: torch.Tensor, out=None):
     logger.debug("GEMS_ASCEND GATHER (strided index)")
     if out is None:
@@ -233,6 +236,7 @@ def gather_strided(inp: torch.Tensor, dim: int, index: torch.Tensor, out=None):
 
 
 # wt-2026-09-04-fix: dispatch non-contiguous index to stride-aware kernel (issue #5746)
+# wt <wangt635@ustc.edu.cn>
 # contiguous -> original flat fast path (unchanged); non-contiguous rank<=MAX_RANK ->
 # gather_strided; rank>MAX_RANK -> contiguous() fallback then flat path.
 def gather(inp, dim, index, out=None, sparse_grad=False):
