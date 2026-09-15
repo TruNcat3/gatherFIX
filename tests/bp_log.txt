@@ -1,0 +1,23 @@
+/usr/local/python3.11.15/lib/python3.11/site-packages/flag_gems/utils/libentry.py:411: RuntimeWarning: active Triton backend does not provide a replay benchmarker; falling back to event timing
+  resolved_benchmark = resolve_benchmarker(
+/usr/local/python3.11.15/lib/python3.11/site-packages/torch_npu/npu/__init__.py:539: UserWarning: You can set the device capability via the environment variable TORCH_NPU_DEVICE_CAPABILITY. The return value of get_device_capability is only for compatibility with PyTorch and does not represent the actual capability of the NPU device.
+  warnings.warn(f"You can set the device capability via the environment variable TORCH_NPU_DEVICE_CAPABILITY. {warning_str}")
+/usr/local/python3.11.15/lib/python3.11/site-packages/flag_gems/utils/device_info.py:58: UserWarning: [device_info] torch_device_fn.get_device_capability returned None for device_id=0, fallback to (0, 0).
+  warnings.warn(
+/usr/local/python3.11.15/lib/python3.11/site-packages/flag_gems/config.py:171: UserWarning: resolve_user_setting: no exclude ops found; returning empty list
+  warnings.warn(
+WARNING:root:Skipped registering operator: This is not allowed since there's already a kernel registered from python overriding ne_.Scalar's behavior for PrivateUse1 dispatch key and aten namespace.
+WARNING:root:Skipped registering operator: This is not allowed since there's already a kernel registered from python overriding ne_.Tensor's behavior for PrivateUse1 dispatch key and aten namespace.
+======================================================================
+gather 性能对照 (fp16, B64xS256xH512)
+======================================================================
+/usr/local/python3.11.15/lib/python3.11/site-packages/flag_gems/runtime/backend/_ascend/ops/gather.py:246: UserWarning: Cannot create tensor with interal format while allow_internel_format=False, tensor will be created with base format. (Triggered internally at ../torch_npu/csrc/aten/common/TensorFactories.cpp:340.)
+  out = torch.empty_like(index, dtype=inp.dtype, device=inp.device)
+A. 连续 index:   原生    0.502 ms | gems  209.941 ms  (418.06x)
+B. 非连续 index (数值一致=True):
+   修复后 strided kernel:    0.292 ms
+   workaround (先物化):      1.032 ms  (修复路径 快 253%)
+   原生物化对照:             1.029 ms
+
+判读: A 组比值即框架既有差距(与本修复无关); B 组 strided 路径避免物化拷贝,
+      应显著快于 workaround —— 这正是修复的性能价值所在。
